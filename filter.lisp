@@ -8,7 +8,7 @@ values returned by filter-ast. (may share structure with original AST?)
 particular code walker (and if needed, store state)"))
 
 (defmethod filter-ast :around (node (walker symbol))
-  ;; shortcut to allow using a class name insteas of instance for walker
+  ;; shortcut to allow using a class name instead of instance for walker
   ;; if it doesn't need initargs
   (filter-ast node (make-instance walker)))
 
@@ -67,7 +67,7 @@ particular code walker (and if needed, store state)"))
                      (loop for (s v) in init
                            do (setf (slot-value new s) v))
                      (ast->sexp new)
-                     ,(if next `(call-next-method new) `new))
+                     ,(if next `(call-next-method new walker) `new))
                    ,(if next `(call-next-method) `node)))))))
 
 
@@ -124,6 +124,7 @@ particular code walker (and if needed, store state)"))
   (special-form-unwind-protect protected-form :next))
 
 (defmethod filter-ast :around ((node form-with-scope) walker)
+  (assert (env node))
   (let ((*lexical-environment* (cons (env node) *lexical-environment*)))
     (call-next-method)))
 
@@ -158,6 +159,8 @@ particular code walker (and if needed, store state)"))
                       :args (mapcar 'sexp->ast args)
                       :whole (w)))
       (symbol
+       (cons->ast op (cons op args))
+       #++
        (make-instance 'function-application
                       :binding (lookup-function op)
                       :args (mapcar 'sexp->ast args)

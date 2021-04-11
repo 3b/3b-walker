@@ -118,4 +118,6 @@
    #:walk-ast
    #:filter-ast
    #:copy-node
-   #:sexp->ast))
+   #:sexp->ast
+   #:add-host-macro
+   #:add-host-function))

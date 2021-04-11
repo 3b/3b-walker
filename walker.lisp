@@ -1,3 +1,4 @@
+#++ (ql:quickload '3b-walker)
 (in-package #:3b-walker)
 
 ;;; bindings in lexical environment
@@ -61,7 +62,10 @@
   ())
 
 (defclass host-function (function-binding)
-  ((cmacro :reader cmacro :initarg :compiler-macro)))
+  ;; designator for host function, since it might not match name used
+  ;; inside a dsl
+  ((designator :Reader designator :initarg :designator)
+   (cmacro :reader cmacro :initarg :compiler-macro)))
 
 (defclass host-macro (function-binding)
   ((cmacro :reader cmacro :initarg :compiler-macro)
@@ -115,23 +119,58 @@
 
 ;;; lexical environment
 
-(defclass lexical-environment ()
+(defclass environment ()
   ((variables :reader variables :initform (make-hash-table))
    (functions :reader functions :initform (make-hash-table))
    ;; possibly should combine with FUNCTIONS slot using an equal hash?
-   (setf-functions :reader setf-functions :initform (make-hash-table))
-   (blocks :reader blocks :initform (make-hash-table))
+   (setf-functions :reader setf-functions :initform (make-hash-table))))
+
+(defclass lexical-environment (environment)
+  ((blocks :reader blocks :initform (make-hash-table))
    (lock :reader lock :initform nil :initarg :lock)
    ;; link to ast node defining this env
    (context :Reader context :initform nil :initarg :context)))
 
-(defun add-host-macro (name &optional (env (car *lexical-environment*)))
-  (setf (gethash name (functions env))
+(defclass host-environment (environment)
+  ;; optional env that just looks things up in (global) host env
+  ())
+
+
+(defvar *lexical-environment* nil)
+;; not sure if this should be separate or not? don't really want to
+;; add free vars to closest enclosing scope, since probably want to
+;; treat all refs to same name within a function as references to a
+;; single free var, but also don't really want to keep them around
+;; forever like putting them in a global env does.
+(defvar *undefined-environment* (make-instance 'lexical-environment))
+
+(defun add-host-macro (name &key (env (car *lexical-environment*))
+                              alias)
+  "Add host macro defined by NAME to ENV or current environment as
+NAME, or ALIAS if provided."
+  (setf (gethash (or alias name) (functions env))
         (make-instance
          'host-macro
-         :name name
+         :name (or alias name)
          :expander (macro-function name)
          :compiler-macro (compiler-macro-function name))))
+
+(defun add-host-function (name &key (env (car *lexical-environment*))
+                                 alias)
+  "Add host function defined by NAME to ENV or current environment as
+NAME, or ALIAS if provided."
+  (setf (gethash (or alias name) (functions env))
+        (make-instance
+         'host-function
+         :name (or alias name)
+         :designator name
+         :compiler-macro (compiler-macro-function name))))
+
+(defmacro with-host-environment (() &body body)
+  `(let ((*lexical-environment*
+           (append *lexical-environment*
+                   (list (make-instance 'host-environment)))))
+     ,@body))
 
 (defun make-cl-environment ()
   (let ((env (make-instance 'lexical-environment :lock t :context "CL")))
@@ -151,13 +190,9 @@
           when (fboundp s)
             do (cond
                  ((macro-function s)
-                  (add-host-macro s))
+                  (add-host-macro s :env env))
                  (t
-                  (setf (gethash s (functions env))
-                        (make-instance
-                         'host-function
-                         :name s
-                         :compiler-macro (compiler-macro-function s)))))
+                  (add-host-function s :env env)))
           when (fboundp ss)
             do (setf (gethash s (setf-functions env))
                      (make-instance
@@ -166,32 +201,64 @@
                       :compiler-macro (compiler-macro-function ss))))
     env))
 
-(defvar *lexical-environment* (list (make-cl-environment)))
-;; not sure if this should be separate or not? don't really want to
-;; add free vars to closest enclosing scope, since probably want to
-;; treat all refs to same name within a function as references to a
-;; single free var, but also don't really want to keep them around
-;; forever like putting them in a global env does.
-(defvar *undefined-environment* (make-instance 'lexical-environment))
+(setf *lexical-environment* (or *lexical-environment*
+                                (list (make-cl-environment))))
+
+(defmethod %lookup-variable (name env)
+  (gethash name (variables env)))
+
+(defmethod %lookup-variable (name (env host-environment))
+  (or (gethash name (variables env))
+      (and (boundp name)
+           (setf (gethash name (variables env))
+                 (make-instance 'host-variable
+                                :name name
+                                :context env)))))
 
 (defun lookup-variable (name)
   (or (loop for e in *lexical-environment*
-            when (gethash name (variables e))
+            when (%lookup-variable name e)
               return it)
       (gethash name (variables *undefined-environment*))
       (setf (gethash name (variables *undefined-environment*))
             (make-instance 'free-variable :name name))))
 
 (defun make-constant ())
+
+
+(defmethod %lookup-function (name env)
+  (gethash name (functions env)))
+
+(defmethod %lookup-function (name (env host-environment))
+  (or (gethash name (functions env))
+      (and
+       (fboundp name)
+       (cond
+         ((macro-function name)
+          (make-instance 'host-macro
+                         :name name
+                         :context env
+                         :compiler-macro (compiler-macro-function name)
+                         :expander (macro-function name)))
+         ((special-operator-p name)
+          (error "unrecognized special operator ~s in host env?" name))
+         (t
+          (setf (gethash name (functions env))
+                (make-instance 'host-function
+                               :name name
+                               :context env
+                               :compiler-macro (compiler-macro-function name)
+                               :designator name)))))))
+
 (defun lookup-function (name)
   #++
   (format t "lookup ~s -> ~s~%"
           name
           (loop for e in *lexical-environment*
-                when (gethash name (functions e))
+                when (%lookup-function name e)
                   return it))
   (or (loop for e in *lexical-environment*
-            when (gethash name (functions e))
+            when (%lookup-function name e)
               return it)
       (gethash name (functions *undefined-environment*))
       (setf (gethash name (functions *undefined-environment*))
@@ -210,6 +277,7 @@
         (flet ((set-context (a)
                  (let ((e (car *lexical-environment*)))
                    (assert (typep a 'form-with-scope))
+                   (assert e)
                    (setf (slot-value a 'env) e)
                    (setf (slot-value e 'context) a))))
           (declare (ignorable #'set-context))
@@ -266,12 +334,16 @@
 
 
 (defun add-block-binding (block-name)
-  ;; todo: block namespace
-  (make-instance 'block-binding :name block-name))
+  (let ((env (car *lexical-environment*)))
+    (assert env)
+    (assert (not (lock env)))
+    (setf (gethash block-name (blocks env))
+          (make-instance 'block-binding :name block-name))))
 
 (defun lookup-block (block-name)
-  ;; todo: block namespace
-  (make-instance 'block-binding :name block-name))
+  (gethash block-name (blocks (car *lexical-environment*))
+           (make-instance 'block-binding
+                          :name (list :unknown-block block-name))))
 
 (defun add-go-tag (tag)
   ;; todo: go tag namespace
@@ -510,7 +582,7 @@
 ;;; conversion APIs
 
 ;; user API
-(defgeneric sexp->ast (form))
+(defgeneric sexp->ast (form &key))
 (defun ast->sexp (ast &key restore-macros)
   (walk-ast ast (make-instance 'ast->sexp :collapse-macros restore-macros)))
 
@@ -525,13 +597,15 @@
 ;; for now, keywords and non-symbol atoms are kept as-is in AST, but
 ;; NIL gets a constant-ref wrapper so filter can distinguish it from
 ;; something trying to remove a form from a list
-(defmethod sexp->ast ((form null))
-  (lookup-variable nil))
+(defmethod sexp->ast ((form null) &key)
+  (make-instance 'constant-reference
+                 :binding (lookup-variable nil)
+                 :name nil))
 
-(defmethod sexp->ast ((form t))
+(defmethod sexp->ast ((form t) &key)
   form)
 
-(defmethod sexp->ast ((form symbol))
+(defmethod sexp->ast ((form symbol) &key)
   (cond
     ;; not sure if keywords should be 'constants' or just stay keywords?
     ((keywordp form) form)
@@ -550,7 +624,7 @@
 
 
 ;; for conses, dispatch to cons->ast which should eql-specialize on CARs
-(defmethod sexp->ast ((form cons))
+(defmethod sexp->ast ((form cons) &key)
   (cons->ast (car form) form))
 
 (defun add-lambda-list-bindings (lambda-list)
@@ -1016,7 +1090,6 @@ code walker (and if needed, store state)"))
 (defmethod walk-ast ((node symbol-macro-reference) walker)
   (walk-ast (expansion node) walker))
 
-
 (defmethod walk-ast ((node lambda-function) walker)
   (walk-bindings node walker)
   (call-next-method))
@@ -1024,6 +1097,10 @@ code walker (and if needed, store state)"))
 (defmethod walk-ast ((node lambda-application) walker)
   (walk-list (args node) walker)
   (walk-ast (func node) walker))
+
+(defmethod walk-ast ((node function-application) walker)
+  (walk-list (args node) walker)
+  ())
 
 (defmethod walk-ast ((node function-application) walker)
   (walk-list (args node) walker))
@@ -1368,7 +1445,7 @@ code walker (and if needed, store state)"))
     (loop for i in (reverse (declarations node))
           do (push i l))
     (push (walk-list/c (bindings node) walker) l)
-    (cons 'let l)))
+    (cons 'let* l)))
 
 (defmethod walk-ast ((node special-form-load-time-value)
                      (walker ast->sexp))
@@ -1795,3 +1872,246 @@ code walker (and if needed, store state)"))
   (format t "~&inc sff ~s ~s | ~s ~%" (name (binding node)) (type-of node)
           (type-of (binding node)))
   (incf (gethash (binding node) (variables walker) 0)))
+
+;;; collect all nodes with multiple possible return values, and the
+;;; nodes that might be returned from them, along with context
+;;; indicating how return value is (or isn't) used. context is either
+;;; :unused or parent ast node
+
+
+(defclass ast-returns ()
+  ;; for now just a hash table of node -> (context . returned-nodes)
+  ((rets :reader rets :initform (make-hash-table))))
+
+(defvar *ast-ret*)
+(defvar *ast-ret-callers* '(:toplevel))
+
+(defun ast-returns (ast)
+  (let ((r (make-instance 'ast-returns)))
+    (let ((*ast-ret*))
+      (walk-ast ast r))
+    (rets r)))
+
+
+(defclass phi ()
+  ((node :reader node :initarg :node)
+   (rets :reader rets :initarg :rets)
+   (@ :reader @ :initarg :@)))
+
+(defun add-phi (node walker)
+  (assert (not (gethash node (rets walker))))
+  (when (boundp '*ast-ret*)
+   (let ((ret *ast-ret*))
+     (when (and (consp *ast-ret*))
+       (setf ret (make-instance 'phi
+                                :node node
+                                :rets *ast-ret*
+                                :@ *ast-ret-callers*)))
+     (when t ;(typep ret 'phi)
+       (setf (gethash node (rets walker)) ret)
+       (setf *ast-ret* ret)))))
+
+;; keep track of callers so we can add entries from nodes with variant
+;; returns rather than callers
+(defmethod walk-ast :around (node
+                             (walker ast-returns))
+  (let ((*ast-ret-callers* (list* node *ast-ret-callers*)))
+    (prog1
+        (call-next-method)
+      (when (boundp '*ast-ret*)
+        (format t "~&@@@~s: ret ~s~% at ~s~%"
+                node *ast-ret* *ast-ret-callers*)
+        (setf *ast-ret* (or *ast-ret* node)))
+      (when (typep node '(or application))
+       (add-phi node walker))
+)))
+
+;; default to just returning the node itself
+(defmethod walk-ast ((node ast-node) (walker ast-returns))
+  (unless *ast-ret*
+    (format t "~&:::: def set ~s~%" node)
+    (setf *ast-ret* node))
+  (call-next-method))
+;; implicit progNs add any nodes with multiple returns, with context
+;; :unused or NODE depending on whether it is last form or not
+
+(defun implicit-progn-rets (node walker)
+  (let ((ret (lookup-variable nil)))
+    (loop for (b . more) on (body node)
+          do (let ((*ast-ret* nil)
+                   ;; modify caller list depending on whether we use the
+                   ;; return value
+                   (*ast-ret-callers*
+                     (if more
+                         (list* `(:unused@ ,node) (cdr *ast-ret-callers*))
+                         (list* node (cdr *ast-ret-callers*)))))
+               (walk-ast b walker)
+               (unless more
+                 (format t "::::: last form of progn = ~s~%"
+                         (ast->sexp b))
+                 (format t "      returns ~s~%"
+                         (ast->sexp *ast-ret*))
+                 ;; save the returns of last form so we can return it
+                 (setf ret *ast-ret*))))
+    (format t "~&::::: ipr set rets = ~s~%" ret)
+    (setf *ast-ret* ret)))
+
+(defmethod walk-ast ((node implicit-progn)
+                     (walker ast-returns))
+  (implicit-progn-rets node walker))
+
+(defmethod walk-ast ((node special-form-tagbody)
+                     (walker ast-returns))
+  (implicit-progn-rets node walker))
+
+;; nodes that might have multiple returns
+
+(defmethod walk-ast ((node special-form-if)
+                     (walker ast-returns))
+  (let ((ret nil))
+    (flet ((a ()
+             (if (consp *ast-ret*)
+                 (setf ret (append *ast-ret* ret))
+                 (push *ast-ret* ret))))
+      (let ((*ast-ret* nil))
+        ;; value of TEST isn't returned
+        (walk-ast (test node) walker)
+        ;; THEN and ELSE can be returned
+        (walk-ast (then node) walker)
+        (a)
+        (walk-ast (else node) walker)
+        (a)))
+    #++(assert (not (gethash node (rets walker))))
+    #++(setf (gethash node (rets walker))
+          (list* (list :@ (cadr *ast-ret-callers*))
+                 ret))
+    (format t "~&:::: if ret ~s ~%" ret)
+    (setf *ast-ret* ret)))
+
+(defvar *block-rets* (make-hash-table))
+(defmethod walk-ast ((node special-form-block)
+                     (walker ast-returns))
+  (unwind-protect
+       (let ((ret (lookup-variable NIL)))
+         (let ((*ast-ret*))
+           (format t "==== add block ~s (~s)~%"
+                   (name (binding node))
+                   (binding node))
+           (setf (gethash (binding node) *block-rets*) nil)
+           (let ((*ast-ret*))
+             (implicit-progn-rets node walker)
+             (setf ret *ast-ret*)
+             (format t " === progn ret = ~s~%" ret))
+           (when (gethash (binding node) *block-rets*)
+             (format t "block rets = ~s~%" (gethash (binding node) *block-rets*))
+             (setf ret (list* *ast-ret*
+                              (gethash (binding node) *block-rets*))))
+           #++(assert (not (gethash node (rets walker))))
+           #++(setf (gethash node (rets walker))
+                    (list* (list :@ (cadr *ast-ret-callers*))
+                           ret)))
+         (setf *ast-ret* ret)
+         (format t "==== remove block ~s (~s)~% ret=~s~%"
+                 (name (binding node))
+                 (binding node)
+                 *ast-ret*))
+    (remhash (binding node) *block-rets*)
+    ))
+
+;; return-from adds to corresponding block
+(defmethod walk-ast ((node special-form-return-from)
+                    (walker ast-returns))
+  (format t "==== return-from ~s = ~s = ~s @ ~s~%"
+          (name (binding node)) (ast->sexp (result node))
+          (gethash (binding node) *block-rets* :???)
+          node)
+  (let ((*ast-ret*))
+    (walk-ast (result node) walker)
+    (push *ast-ret* (gethash (binding node) *block-rets*)))
+  ;; fixme: add a class or something to indicate forms that don't
+  ;; return normally
+  (format t "~&:::: return-from :nlx~%")
+  (setf *ast-ret* (vector :nlx node)))
+
+
+;; fixme: explicitly catch the case where throw isn't inside a catch?
+(defvar *catch-rets*)
+(defmethod walk-ast ((node special-form-catch)
+                     (walker ast-returns))
+  (let ((throws nil)
+        (ret nil))
+    ;; can't catch any THROWs inside TAG form
+    (let ((*ast-ret*))
+      (walk-ast (tag-ast node) walker))
+    ;; collect return value and throw values from body
+    (let ((*ast-ret*)
+          (*catch-rets* nil))
+      (implicit-progn-rets node walker)
+      (setf ret *ast-ret*)
+      (setf throws *catch-rets*))
+    ;; add to any parent catches too
+    (when (boundp '*catch-rets*)
+      (setf *catch-rets* (append throws *catch-rets*)))
+    (setf *ast-ret* (remove-duplicates
+                     (append (a:ensure-list ret)
+                             (a:ensure-list throws)))
+          #++(if (consp throws)
+                 (list* ret throws)
+                 ret))
+    (format t "~&:::: catch ~s" *ast-ret*)
+    #++(when throws
+         (setf (gethash node (rets walker))
+               (list* (list :@ (cadr *ast-ret-callers*))
+                      *ast-ret*)))))
+
+
+(defmethod walk-ast ((node special-form-throw)
+                     (walker ast-returns))
+  (let ((*ast-ret*))
+    (walk-ast (tag node) walker)
+    (walk-ast (result node) walker)
+    (when (boundp '*catch-rets*)
+      (push *ast-ret* *catch-rets*)))
+  ;; fixme: add a class or something to indicate forms that don't
+  ;; return normally
+  (format t "~&:::: throw :nlx~%")
+  (setf *ast-ret* (vector :nlx node)))
+
+;; notice some functions that don't return
+(defmethod walk-ast ((node function-application)
+                     (walker ast-returns))
+  (call-next-method)
+  (setf *ast-ret* node)
+  (when (member (name (binding node)) '(error
+                                        #+sbcl SB-KERNEL:ECASE-FAILURE))
+    (format t "&&& got nlx @ ~s~%" (name (binding node)))
+    (setf *ast-ret* (vector :nlx node))))
+
+#++
+(ast-returns
+ (sexp->ast
+  '(block nil
+    (catch a
+      (ecase foo
+        (1 (throw a1 :a1)
+         11)
+        (2 (catch b
+             (throw b1 :b1)
+             (throw a2 :a2))
+         22)
+        (3 (catch c
+           (throw c1 :c1)
+           (throw a3 :a3))
+         33)
+        (4 123))
+      )
+    (if a
+        (return 'foo)
+        (progn
+          (return bar)
+          2)))))
+#++
+(trace :methods t walk-ast)
+#++
+(untrace)
+
